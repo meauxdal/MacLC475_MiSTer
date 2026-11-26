@@ -26,6 +26,7 @@ module ap68040
 	parameter bit         DUAL         = 1,      // dual issue: the second slot (ap68040_pkg s1_t)
 	parameter bit         BTIC         = 1,      // the fetch BTB's target words
 	parameter bit         DM_EARLY_TA  = 1,      // the DMU takes TA in its own clock (biu done_e)
+	parameter bit         DM_FAST_BUS  = 1,      // the DMU starts a store that misses the cache a clock sooner
 	// DUAL: the second slot's classes {load, An, Dn}.  Loads are off: on the
 	// Minimig (2026-10-23) a second-slot MOVE (Ay),Dx returned wrong data
 	// now and then -- the hard-disk boot read garbage, and PFS3 wrote it
@@ -38,7 +39,8 @@ module ap68040
 	// platform cacheability (ap68040_dmu): 0 = as upstream
 	parameter bit          PA_IO_SERIAL = 0,
 	parameter logic [31:0] PA_C0_MASK = 32'h0, PA_C0_MATCH = 32'h0,
-	parameter logic [31:0] PA_C1_MASK = 32'h0, PA_C1_MATCH = 32'h0
+	parameter logic [31:0] PA_C1_MASK = 32'h0, PA_C1_MATCH = 32'h0,
+	parameter logic [31:0] PA_NS_MASK = 32'h0, PA_NS_MATCH = 32'h0   // reads without side effects
 )(
 
 	input  logic        clk,
@@ -334,9 +336,10 @@ ap68040_backend #(.HAS_FPU(HAS_FPU), .FPU_REVISION(FPU_REVISION), .FPU_PIPE(FPU_
 );
 
 logic [14:0] dm_perf;
-ap68040_dmu #(.DC1_ATC(DC1_ATC), .PA_IO_SERIAL(PA_IO_SERIAL),
+ap68040_dmu #(.DC1_ATC(DC1_ATC), .FAST_BUS(DM_FAST_BUS), .PA_IO_SERIAL(PA_IO_SERIAL),
 	.PA_C0_MASK(PA_C0_MASK), .PA_C0_MATCH(PA_C0_MATCH),
-	.PA_C1_MASK(PA_C1_MASK), .PA_C1_MATCH(PA_C1_MATCH)) dmu (
+	.PA_C1_MASK(PA_C1_MASK), .PA_C1_MATCH(PA_C1_MATCH),
+	.PA_NS_MASK(PA_NS_MASK), .PA_NS_MATCH(PA_NS_MATCH)) dmu (
 	.clk(clk), .nreset(nreset),
 	.adv_ag(adv_ag), .dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem),
 	.dm_msz(dm_msz), .dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke),

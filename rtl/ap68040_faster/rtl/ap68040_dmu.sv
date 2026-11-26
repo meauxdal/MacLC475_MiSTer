@@ -65,7 +65,21 @@ module ap68040_dmu
 	// cacheable, and the bus's TCI comes too late to stop a speculative read.
 	parameter bit          PA_IO_SERIAL = 0,
 	parameter logic [31:0] PA_C0_MASK = 32'h0, PA_C0_MATCH = 32'h0,
-	parameter logic [31:0] PA_C1_MASK = 32'h0, PA_C1_MATCH = 32'h0
+	parameter logic [31:0] PA_C1_MASK = 32'h0, PA_C1_MATCH = 32'h0,
+	// A plain store that misses the cache (or with the cache off) goes from
+	// E_IDLE straight to E_BUS, deciding there what E_W_PART would decide
+	// two clocks later, and its bus transfer leaves DC1's lookup good
+	// (e_busq).  A store's last piece answers WB at its TA instead of
+	// through E_W_DONE.  (Loads gain nothing from the first: a
+	// noncachable read waits at E_S_START for the older instructions
+	// anyway, dm_older.)
+	parameter bit          FAST_BUS = 1,
+	// A physical window whose reads have no side effects (a frame buffer
+	// that PA_IO_SERIAL makes serialized): a plain read there goes from
+	// E_S_START straight to E_BUS without waiting for the older
+	// instructions.  Should one of them discard it, nothing was disturbed.
+	// Mask 0: off.
+	parameter logic [31:0] PA_NS_MASK = 32'h0, PA_NS_MATCH = 32'h0
 )
 (
 	input  logic        clk,
@@ -244,6 +258,9 @@ typedef struct packed {
 	logic        fast;     // DC2 can answer from the RAM output
 	logic        sfast;    // a load across a line whose first part hit:
 	                       // DC2's copy holds it, one lookup for the rest
+	logic        m16a;     // a MOVE16 store whose source read had nothing
+	                       // older in flight (see m16_pre)
+	logic        pre;      // ... whose bus write the engine started early
 } mrec_t;
 
 req_t  m1;
@@ -675,7 +692,6 @@ end
 // (the engine's state for the bench's profile: a parameterized module's
 // enum items are not reachable through the hierarchy in Verilator)
 wire sim_es_s  = (e_st == E_S_START);
-wire sim_es_w  = (e_st == E_W_START);
 wire sim_es_m  = (e_st == E_M_START);
 wire sim_es_tw = (e_st == E_TW_START);
 wire sim_es_i  = (e_st == E_IDLE);
@@ -736,6 +752,14 @@ function automatic logic st_line(input mrec_t m, input logic [27:0] l);
 	          (m.x.pa[11:4] == l[7:0] || (m.split && m.x1.pa[11:4] == l[7:0]));
 endfunction
 wire hz = st_line(m3, m2_line) || st_line(m4, m2_line);
+// DC2's load is a plain read of the no-side-effect window (PA_NS_*), or a
+// MOVE16 source line there (it never hits): what E_S_ACT would send to the
+// bus a clock later, older stores (EX, WB) gone
+wire ns_rd = (PA_NS_MASK != 32'h0) && FAST_BUS && (m2.r.mem == M_LD) && !m2.split && !m2.sfast &&
+             m2.x.ok && !m2.x.flt && m2.x.cm[1] && !(m2.x.hit && dc_en) &&
+             !m2.r.lock && (m2.r.ack == 2'd0) && !m2.r.pastc &&
+             ((m2.x.pa & PA_NS_MASK) == PA_NS_MATCH) &&
+             !(m3.r.v && m3.r.mem != M_LD) && !(m4.r.v && m4.r.mem != M_LD);
 // the fast load (never split) waits only for a store whose bytes it reads:
 // a plain store within one line is compared by bytes, anything else (RMW,
 // split, MOVE16) by the line
@@ -760,10 +784,15 @@ wire fast_now = m2.r.v && m2.fast && !hzf && !(dw && !dwp && dw_set == m2.r.a[CS
 wire [31:0] fast_data = take({dq2, 64'd0}, {2'd0, m2.r.a[1:0]}, nbytes(m2.r.msz));
 
 // a store with its translation known needs nothing from DC2 unless it must
-// allocate (copyback miss), is split, or is a MOVE16 destination
+// allocate (copyback miss), is split, or is a MOVE16 destination that hits
+// (the engine invalidates that line; a MOVE16 store that misses, or with
+// the data cache off, has nothing to do there -- E_S_ACT would trust this
+// same lookup -- and a frame buffer destination never hits).  A MOVE16
+// store allocates nothing, copyback or not
 wire st_simple = m2.r.v && (m2.r.mem == M_ST) && m2.x.ok && !m2.x.flt && !m2.split &&
-                 (m2.r.msz != SZ_Q) &&
-                 !(dc_en && m2.x.cm == 2'b01 && !m2.x.hit && !m2.r.noalloc && !m2.r.lock);
+                 (m2.r.msz != SZ_Q || !m2.x.hit || !dc_en) &&
+                 !(dc_en && m2.x.cm == 2'b01 && !m2.x.hit && !m2.r.noalloc && !m2.r.lock &&
+                   m2.r.msz != SZ_Q);
 
 //--------------------------------------------------------------------------
 // engine
@@ -815,10 +844,26 @@ typedef struct packed {
 	logic  [1:0] tln;
 } bop_t;
 bop_t        bo;
-// a plain operand transfer on the bus (a noncachable read): the engine
-// touches neither the cache nor its read ports
-wire  e_busq  = (e_st == E_BUS || e_st == E_BUS_W) && !bo.line && !steal &&
-                (e_ret == E_S_BUSD);
+// the store job E_IDLE sent straight to the bus (FAST_BUS: a miss or
+// the cache off) has no line to update or push
+logic        e_wq;
+// ... set up as the store left EX (ex_wq): in its first E_BUS clock, the
+// store's first WB clock, its data comes from st_data, not bo_wd
+logic        e_exw;
+// a plain operand transfer on the bus (a noncachable read, or such a
+// store): the engine touches neither the cache nor its read ports
+// (A line write of mv_line, the MOVE16 store E_IDLE or m16_pre sent
+// straight to the bus, touches neither either: its data is in bo_line.)
+wire  e_busq  = (e_st == E_BUS || e_st == E_BUS_W) && !steal &&
+                ((!bo.line && (e_ret == E_S_BUSD || (e_ret == E_W_DONE && e_wq))) ||
+                 (bo.line && !bo.rd && e_ret == E_W_DONE && e_wq));
+// An early MOVE16 store (m16_pre): the engine runs its line write from
+// DC2 and keeps the outcome for WB
+logic        e_pre;               // the engine's job is that write
+logic        pre_done;            // it ended (until its uop leaves WB)
+logic        pre_err;             // ... with a bus error
+logic        m16_alone;           // a MOVE16 read left DC2 alone (m16a for
+                                  // the next memory uop into DC2)
 // engine states that write no data, tag or valid bit: the RAM outputs a
 // lookup captured stay good (a fast split read; the RAM re-reads the held
 // DC1 set after its stolen read, steal_q)
@@ -844,6 +889,9 @@ logic [CSB-1:0] f_set;
 // one and not the other are given the other's set)
 always_comb ld_ra = lv_ra;
 logic  [1:0] f_way;
+// a load's fill requested from E_S_ACT: its victim steps (E_FILL, E_FILLW,
+// E_FILL_W's) run while the line is on the bus; 0 when done
+logic  [1:0] fv;
 logic [CTW-1:0] f_tag;
 logic        pv_v;                // push buffer holds a dirty line
 logic [127:0] pv_line;
@@ -968,7 +1016,61 @@ wire fast_wait = m2.r.v && m2.fast && (hzf || (dw && !dwp && dw_set == m2.r.a[CS
 wire ex_st    = m3.r.v && (m3.r.mem != M_LD);
 wire dc2_slow = m2.r.v && !fast_now && !fast_wait && !(st_simple && !e_job) && !e_dc2_done && !e_job &&
                 !ex_st;
-wire wb_slow  = wb_st && !wb_fast && !wb_fs && !wfs_p1 && !e_wst_done;
+wire wb_slow  = wb_st && !wb_fast && !wb_fs && !wfs_p1 && !e_wst_done && !m4.pre;
+// A store leaving EX whose WB job would be E_IDLE's plain bus write (a
+// miss or the cache off, one part, not locked, not MOVE16): its job is
+// set up as it leaves, so the clock it enters WB is E_BUS's request
+// clock, one clock sooner.  Its data is st_data, valid in WB only: the
+// BIU samples a single write's data with the request (b_wdata takes
+// st_data in that clock, bo_wd takes it for the pieces after).  Whether
+// the store reaches WB is not decided here: E_BUS asks only with the
+// store in WB and st_v (no exception, not suppressed); otherwise -- an
+// exception, a kill as it moved -- the job is dropped (e_exw) before it
+// asked.  A store in WB with st_v is not discarded (an interrupt or
+// trace waits for WB to commit), as for the job E_IDLE starts in WB.
+// No DC2 job races it: none starts while a store is in EX (ex_st), and
+// the engine is idle.
+wire ex_wq    = FAST_BUS && m3.r.v && (m3.r.mem == M_ST || m3.r.mem == M_RMW) &&
+                !m3.pre && !m3.split && !m3.r.lock && (m3.r.msz != SZ_Q) &&
+                !(m3.x.hit && dc_en);
+wire exw_ok   = m4.r.v && st_v;          // the store arrived, valid
+wire [31:0] bo_wdx = e_exw ? lalign(st_data, m4.r.msz) : bo_wd;
+// synthesis translate_off
+// (the bench's profile: a WB store job starts)
+wire sim_es_w = (e_st == E_IDLE) && !sn_frz && !wfs_p1 && !(mt_v && !mt_done) &&
+                (wb_slow || (ex_wq && adv_ex));
+// synthesis translate_on
+// An early MOVE16 store: a MOVE16's store half to the side-effect-free
+// frame buffer window (PA_NS), or to cachable memory that the data cache
+// does not hold, starts its line write while still in DC2, rather than
+// from WB, which it would reach 2-3 clocks later (a cachable miss also
+// skips E_S_START's empty job: a MOVE16 store allocates nothing).  The
+// cache cannot take that line before the write ends: nothing older is in
+// flight, and a newer access to it misses and waits for the engine.
+// Allowed only when its own source read left DC2 with nothing older in EX
+// or WB and without a fault (m16a): then nothing can discard the store -- the
+// read cannot fault any more, a MOVE16 uop neither serializes nor
+// redirects, and an interrupt or trace waits for the instruction's end.
+// Its data is mv_line, which that read filled.  WB takes the outcome
+// from pre_done/pre_err (wb_pre), a bus error included.
+wire m16_pre = (PA_NS_MASK != 32'h0) && FAST_BUS && m2.r.v && m2.m16a && !m2.pre &&
+               (m2.r.mem == M_ST) && (m2.r.msz == SZ_Q) && !m2.split &&
+               m2.x.ok && !m2.x.flt && !(m2.x.hit && dc_en) &&
+               (!m2.x.cm[1] || ((m2.x.pa & PA_NS_MASK) == PA_NS_MATCH)) &&
+               !m2.r.lock && (m2.r.ack == 2'd0) && !e_pre && !pre_done;
+wire wb_pre  = wb_st && m4.pre && pre_done && !e_wst_done;
+// a MOVE16 source read leaving DC2 answered, without a fault, with
+// nothing older in EX or WB (the next memory uop is its store half)
+wire m16_ld_out = adv_dc2 && m2.r.v && (m2.r.mem == M_LD) && (m2.r.msz == SZ_Q) &&
+                  e_dc2_done && !e_flt && !dm_older && !kill_now;
+// ... the same decided a clock sooner, as the store moves from DC1 into
+// DC2 with its lookup (x_dc1) good: what m16_pre would see there
+wire m16_pre1 = (PA_NS_MASK != 32'h0) && FAST_BUS && adv_dc1 && m1.v && !m1_stale &&
+                (m16_alone || m16_ld_out) &&
+                (m1.mem == M_ST) && (m1.msz == SZ_Q) &&
+                x_dc1.ok && !x_dc1.flt && !(x_dc1.hit && dc_en) &&
+                (!x_dc1.cm[1] || ((x_dc1.pa & PA_NS_MASK) == PA_NS_MATCH)) &&
+                !m1.lock && (m1.ack == 2'd0) && !e_pre && !pre_done;
 // A second slot's load is answered by the fast path or not at all: what
 // would take the engine -- a miss, a noncachable or split access, a table
 // search, a fault -- ends it with a fault at once, which the back end
@@ -982,7 +1084,8 @@ always_ff @(posedge clk)
 // store ready: the fast store answers in its own WB cycle (the engine's
 // stores through the registered pulse)
 logic st_rdy_r, st_fault_r;
-assign st_rdy   = st_rdy_r || (wb_fast && !sn_frz) || (wfs_p1 && m4.x1.hit && !sn_frz);
+assign st_rdy   = st_rdy_r || (wb_fast && !sn_frz) || (wfs_p1 && m4.x1.hit && !sn_frz) ||
+                  (wb_pre && !pre_err);
 assign st_fault = st_rdy_r && st_fault_r;
 
 // a failed line fill: the long words of the line the access needs (this
@@ -1000,9 +1103,12 @@ logic e_breq;
 logic [5:0] pe_vram;               // perf strobes, dbg_perf[10:5]
 logic [3:0] pe_mmu;                 // perf strobes, dbg_perf[14:11]
 always_comb begin
-	// Scalar request fields are registered before E_BUS; hold until grant.
-	b_req  = e_breq || ((e_st == E_BUS) && !sn_frz && !bo_cancel &&
-	                    !bo.line && !bo.lock && bo.ack == 2'd0 && bo.tt == TT_NORMAL);
+	// Request fields are registered before E_BUS; hold until grant.  A line
+	// transfer (a MOVE16's, a fill) asks in E_BUS too, its bo_line loaded
+	// with the rest; a push waits for e_breq (a snoop may cancel it there)
+	b_req  = e_breq || ((e_st == E_BUS) && !sn_frz && !bo_cancel && (!e_exw || exw_ok) &&
+	                    !(bo.line && bo.tm == TM_PUSH) && !bo.lock && bo.ack == 2'd0 &&
+	                    (bo.tt == TT_NORMAL || bo.tt == TT_MOVE16));
 	b_breq = '0;
 	// acknowledge cycles (TT=3): IACK at $FFFFFFFF, a byte, TM = the level
 	// (7.5.1); the breakpoint acknowledge a byte read at 0, TM = 0 (7.5.2)
@@ -1017,8 +1123,8 @@ always_comb begin
 	b_breq.lock  = bo.lock;
 	b_breq.locke = bo.locke && !bo.rd && (bo.line || bo_left == bo_np);
 	b_wdata      = bo.line ? bo_line :
-	               {96'd0, (bo_np == 3'd1) ? {4{bo_wd[31:24]}} :
-	                       (bo_np == 3'd2) ? {2{bo_wd[31:16]}} : bo_wd};
+	               {96'd0, (bo_np == 3'd1) ? {4{bo_wdx[31:24]}} :
+	                       (bo_np == 3'd2) ? {2{bo_wdx[31:16]}} : bo_wdx};
 end
 
 // (a stale lookup waits the clock its set is read again, rather than
@@ -1094,14 +1200,14 @@ always_ff @(posedge clk) begin
 		// dirty bits have their power-up values from their initial blocks,
 		// and CINVA clears them when the software asks)
 		e_st <= E_IDLE; e_ret <= E_IDLE; e_sret <= E_IDLE; e_wret <= E_IDLE;
-		e_dc2_done <= 1'b0; e_wst_done <= 1'b0;
+		e_dc2_done <= 1'b0; e_wst_done <= 1'b0; e_wq <= 1'b0; e_exw <= 1'b0;
 		e_ldata <= '0; e_flt <= 1'b0; e_faddr <= '0; e_fssw <= '0;
 		e_part <= 1'b0; e_x <= '0; e_va <= '0; e_n <= '0; e_acc <= '0; e_fromline <= 1'b0; e_fillhit <= 1'b0;
 		e_breq <= 1'b0;
 		bo <= '0; bo_wd <= '0; bo_line <= '0; bo_err <= 1'b0; bo_rd <= '0;
 		bo_avec <= 1'b0; bo_tci <= 1'b0; bo_left <= '0; bo_pn <= '0; bo_pa <= '0;
 		steal <= 1'b0; st_la <= '0; st_fc2 <= 1'b0; st_set <= '0;
-		f_set <= '0; f_way <= '0; f_tag <= '0;
+		f_set <= '0; f_way <= '0; f_tag <= '0; fv <= 2'd0;
 		pv_v <= 1'b0; pv_line <= '0; pv_lpa <= '0; pv_dirty <= 1'b0; pv_tln <= '0; pv_lock <= 1'b0;
 		pv_for <= 2'd0; pbe_r <= 1'b0; pbe_a <= '0;
 		mv_line <= '0;
@@ -1121,6 +1227,7 @@ always_ff @(posedge clk) begin
 		iatc_wla <= '0; iatc_wfc2 <= 1'b0; iatc_went <= '0;
 		iw_ent <= '0;
 		e_kill <= 1'b0;
+		e_pre <= 1'b0; pre_done <= 1'b0; pre_err <= 1'b0; m16_alone <= 1'b0;
 		sp_dw  <= 1'b0;
 		sp_job <= 1'b0;
 		wfs_p1 <= 1'b0;
@@ -1178,6 +1285,8 @@ always_ff @(posedge clk) begin
 			m2.x     <= x_dc1;
 			m2.split <= m1_split;
 			m2.x1    <= '0;
+			m2.pre   <= 1'b0;
+			m2.m16a  <= m1.v && (m16_alone || m16_ld_out) && (m1.mem == M_ST) && (m1.msz == SZ_Q);
 			m2.fast  <= m1_fast && !m1_stale && !(dw && dw_src != 2'd0 && dw_set == m1.a[CSH:4]) &&
 			            e_idleq;
 			// (a store reads nothing: the copy's state does not matter; its
@@ -1204,6 +1313,36 @@ always_ff @(posedge clk) begin
 		else if (adv_wb) m4.r.v <= 1'b0;
 
 		if (adv_wb) e_wst_done <= 1'b0;
+
+		// the early MOVE16 store (m16_pre): its source read's mark is for
+		// the next memory uop into DC2 only; WB answers from the outcome
+		if (kill_now || (adv_dc1 && m1.v)) m16_alone <= 1'b0;
+		else if (m16_ld_out) m16_alone <= 1'b1;
+		if (wb_pre) begin
+			if (pre_err) begin
+				st_rdy_r   <= 1'b1;
+				st_fault_r <= 1'b1;
+				st_fssw    <= mk_ssw(1'b0, m4.r.lock, 1'b0, m4.r.msz, m4.r.fc);
+				st_faddr   <= m4.r.a;
+				e_wst_done <= 1'b1;
+			end
+			else begin
+				// answered this cycle (st_rdy): kept only if WB does not move
+				st_rdy_r   <= !adv_wb;
+				st_fault_r <= 1'b0;
+				e_wst_done <= !adv_wb;
+			end
+		end
+		if (adv_wb && m4.r.v && m4.pre) begin
+			pre_done <= 1'b0;
+			pre_err  <= 1'b0;
+		end
+		// synthesis translate_off
+		if (kill_now && ((m2.r.v && m2.pre) || (m3.r.v && m3.pre))) begin
+			$display("FAIL: DMU: an early MOVE16 store was discarded");
+			sim_kchk <= 1'b1;
+		end
+		// synthesis translate_on
 
 		//--------------------------------------------------------------
 		// the WB fast store
@@ -1271,6 +1410,7 @@ always_ff @(posedge clk) begin
 		case (e_st)
 		E_IDLE: begin
 			steal <= 1'b0;
+			e_wq  <= 1'b0;
 			// a fetch's walk: its registers loaded whatever the engine takes
 			// up (they are free while it is idle, and every other walk loads
 			// its own), so the job choice -- the kill late in it -- is not
@@ -1283,9 +1423,100 @@ always_ff @(posedge clk) begin
 			else if (mt_v && !mt_done)
 				e_st <= E_M_START;
 			else if (wb_slow) begin
-				e_st <= E_W_START;
+				// the WB store job's setup, here rather than a clock later in
+				// a state of its own (the store waits in WB, m4 and st_data
+				// held): a plain bus write goes straight to E_BUS, the rest
+				// to E_W_PART
+				e_part <= 1'b0;
+				e_acc  <= lalign(st_data, m4.r.msz);
+				e_va   <= m4.r.a;
+				e_x    <= m4.x;
+				e_n    <= m4.split ? 3'(5'd16 - {1'b0, m4.r.a[3:0]}) : nbytes(m4.r.msz);
+				bo_err <= 1'b0;
+				if (FAST_BUS && !m4.split && !m4.r.lock && !(m4.x.hit && dc_en)) begin
+					// E_W_PART's plain bus write, decided two clocks early: a
+					// miss (or the cache off) has no line to push or update.
+					// A MOVE16 store (SZ_Q) goes the same way as a line write
+					// of mv_line, which its source read filled before the
+					// store reached WB.
+					bo.line  <= (m4.r.msz == SZ_Q);
+					bo.rd    <= 1'b0;
+					bo.tt    <= (m4.r.msz == SZ_Q) ? TT_MOVE16 : fc_tt(m4.r.fc);
+					bo.tm    <= fc_tm(m4.r.fc);
+					bo.upa   <= m4.x.upa;
+					bo.ci    <= m4.x.cm[1];
+					bo.lock  <= 1'b0;
+					bo.locke <= m4.r.locke;     // (as E_W_PART: not split)
+					bo.ack   <= m4.r.ack;
+					bo.tln   <= 2'd0;
+					bo_pa    <= (m4.r.msz == SZ_Q) ? {m4.x.pa[31:4], 4'd0} : m4.x.pa;
+					bo_left  <= (m4.r.msz == SZ_Q) ? 3'd4 : nbytes(m4.r.msz);
+					bo_wd    <= lalign(st_data, m4.r.msz);
+					bo_line  <= mv_line;
+					e_wq     <= 1'b1;
+					e_ret    <= E_W_DONE;
+					e_st     <= E_BUS;
+				end
+				else
+					e_st   <= E_W_PART;
 				if (m4.x.ok && !m4.x.flt && m4.x.pa[31:21] == 11'b1111_1001_000)
 					pe_vram[5:4] <= {m4.split, 1'b1};
+			end
+			else if (ex_wq && adv_ex) begin
+				// the same plain bus write, set up as the store leaves EX
+				// (see ex_wq); E_BUS takes its data in WB
+				e_part   <= 1'b0;
+				e_va     <= m3.r.a;
+				e_x      <= m3.x;
+				e_n      <= nbytes(m3.r.msz);
+				bo_err   <= 1'b0;
+				bo.line  <= 1'b0;
+				bo.rd    <= 1'b0;
+				bo.tt    <= fc_tt(m3.r.fc);
+				bo.tm    <= fc_tm(m3.r.fc);
+				bo.upa   <= m3.x.upa;
+				bo.ci    <= m3.x.cm[1];
+				bo.lock  <= 1'b0;
+				bo.locke <= m3.r.locke;
+				bo.ack   <= m3.r.ack;
+				bo.tln   <= 2'd0;
+				bo_pa    <= m3.x.pa;
+				bo_left  <= nbytes(m3.r.msz);
+				e_wq     <= 1'b1;
+				e_exw    <= 1'b1;
+				e_ret    <= E_W_DONE;
+				e_st     <= E_BUS;
+				// (its perf count: in E_BUS, once the store is in WB)
+			end
+			else if ((m16_pre || m16_pre1) && !kill_now) begin
+				// the early MOVE16 store: E_W_START's line write, from DC2
+				// (or from DC1 as the store enters DC2)
+				logic [2:0] pfc; xres_t px;
+				pfc = m16_pre ? m2.r.fc : m1.fc;
+				px  = m16_pre ? m2.x : x_dc1;
+				bo.line  <= 1'b1;
+				bo.rd    <= 1'b0;
+				bo.tt    <= TT_MOVE16;
+				bo.tm    <= fc_tm(pfc);
+				bo.upa   <= px.upa;
+				bo.ci    <= px.cm[1];
+				bo.lock  <= 1'b0;
+				bo.locke <= 1'b0;
+				bo.ack   <= 2'd0;
+				bo.tln   <= 2'd0;
+				bo_pa    <= {px.pa[31:4], 4'd0};
+				bo_left  <= 3'd4;
+				bo_line  <= mv_line;
+				bo_err   <= 1'b0;
+				e_wq     <= 1'b1;
+				e_pre    <= 1'b1;
+				e_ret    <= E_W_DONE;
+				e_st     <= E_BUS;
+				if (!m16_pre)     m2.pre <= 1'b1;   // entering DC2 now
+				else if (adv_dc2) m3.pre <= 1'b1;
+				else              m2.pre <= 1'b1;
+				if (px.pa[31:21] == 11'b1111_1001_000)
+					pe_vram[5:4] <= 2'b01;
 			end
 			else if (((dc2_slow && !dm_s1) || (e_job && m2.r.v && !e_dc2_done)) && !kill_now) begin
 				// Clear at scheduling; a snoop may freeze E_S_START through a kill.
@@ -1327,10 +1558,40 @@ always_ff @(posedge clk) begin
 				st_set <= m2.r.a[CSH:4] + 1'd1;
 				e_st   <= E_SP_W;
 			end
+			else if (m2.r.msz == SZ_Q && m2.r.mem == M_LD && m2.x.ok && !m2.x.flt &&
+			         m2.x.hit && !m2.x.cm[1] && !m2.r.lock && dc_en) begin
+				// a MOVE16 source hit: E_S_ACT would take E_S_RD's line
+				// read with this same lookup; start it now (E_S_RD's work,
+				// two clocks sooner)
+				steal  <= 1'b1;
+				st_set <= m2.r.a[CSH:4];
+				f_way  <= m2.x.way;
+				e_st   <= E_S_RDW;
+			end
+			else if (ns_rd) begin
+				// E_S_ACT's bus read, a clock sooner (PA_NS_*); a MOVE16's
+				// line read as E_S_ACT sets it up
+				logic m16;
+				m16 = (m2.r.msz == SZ_Q);
+				bo.line  <= m16;
+				bo.rd    <= 1'b1;
+				bo.tt    <= m16 ? TT_MOVE16 : fc_tt(m2.r.fc);
+				bo.tm    <= fc_tm(m2.r.fc);
+				bo.upa   <= m2.x.upa;
+				bo.ci    <= 1'b1;
+				bo.lock  <= 1'b0;
+				bo.locke <= 1'b0;
+				bo.ack   <= 2'd0;
+				bo.tln   <= 2'd0;
+				bo_pa    <= m16 ? {m2.x.pa[31:4], 4'd0} : m2.x.pa;
+				bo_left  <= m16 ? 3'd4 : nbytes(m2.r.msz);
+				e_ret    <= E_S_BUSD;
+				e_st     <= E_BUS;
+			end
 			else
 				e_st   <= m2.x.ok ? E_S_ACT : E_S_XL;
 		end
-		E_SP_W: e_st <= E_SP_2;         // the RAMs register the stolen address
+		E_SP_W: e_st <= E_SP_2;        // the RAMs register the stolen address
 		E_SP_3: begin
 			logic [2:0] n0;
 			n0 = 3'(5'd16 - {1'b0, m2.r.a[3:0]});
@@ -1519,7 +1780,36 @@ always_ff @(posedge clk) begin
 				f_tag  <= e_x.pa[31:CSH+1];
 				f_way  <= victim(lve_q, rrc);
 				e_sret <= E_S_XL;
-				e_st   <= E_FILL;
+				if (!bo_cancel) begin
+					// the line read goes to the bus now, what E_FILL_W and
+					// E_BUS would send 4 clocks later.  The line collects
+					// in bo_line and needs no way until E_FILL_INS, so the
+					// victim's steps (fv) run during the burst; E_FILL_INS
+					// waits for them.
+					fv       <= 2'd1;
+					bo.line  <= 1'b1;
+					bo.rd    <= 1'b1;
+					bo.tt    <= TT_NORMAL;
+					bo.tm    <= m2.r.smode ? TM_SDATA : TM_UDATA;
+					bo.upa   <= e_x.upa;
+					bo.ci    <= 1'b0;
+					bo.lock  <= 1'b0;
+					bo.locke <= 1'b0;
+					bo.ack   <= 2'd0;
+					bo.tln   <= victim(lve_q, rrc);   // (TLN: not wired out)
+					bo_pa    <= {e_x.pa[31:CSH+1], e_va[CSH:4], e_va[3:2], 2'b00};
+					bo_left  <= 3'd4;
+					bo_err   <= 1'b0;
+					bo_got   <= 4'd0;
+					bo_tci   <= 1'b0;
+					bo_avec  <= 1'b0;
+					bo_rd    <= '0;
+					bo_ingnt <= 1'b0;
+					e_ret    <= E_FILL_INS;
+					e_breq   <= 1'b1;
+					e_st     <= E_BUS_W;
+				end
+				else e_st <= E_FILL;
 			end
 			else if (rd) begin
 				// cache inhibited, no-allocate miss, locked, MOVE16 miss,
@@ -1574,7 +1864,14 @@ always_ff @(posedge clk) begin
 			e_st   <= E_S_RDW;
 		end
 		E_S_RDW: e_st <= E_S_RD2;
-		E_S_RD2: begin
+		E_S_RD2: if (e_kill) begin
+			// the uop was discarded during the read (E_S_START's MOVE16
+			// source read skips E_S_ACT's check): DC2 may hold a newer uop
+			steal <= 1'b0;
+			e_job <= 1'b0;
+			e_st  <= E_IDLE;
+		end
+		else begin
 			if (m2.r.msz == SZ_Q) mv_line <= dq_w;
 			else e_acc <= (e_acc << (8 * e_n)) | etk;
 			e_st <= E_S_NEXT;
@@ -1583,7 +1880,15 @@ always_ff @(posedge clk) begin
 			// the bus read finished
 			// (an acknowledge cycle's TEA is no access error: IACK takes the
 			// spurious vector, BKPT the illegal instruction exception)
-			if (bo_err && (m2.r.ack == 2'd0)) begin
+			if (e_kill) begin
+				// the uop was discarded while its read was on the bus (a
+				// PA_NS_* read goes before the older instructions are
+				// done): DC2 may hold a newer uop by now, so leave m2 alone
+				steal <= 1'b0;
+				e_job <= 1'b0;
+				e_st  <= E_IDLE;
+			end
+			else if (bo_err && (m2.r.ack == 2'd0)) begin
 				// FA is the operand's first byte even when a later part
 				// faulted (MA marks an ATC fault only, 8.4.6.2)
 				e_flt   <= 1'b1;
@@ -1603,6 +1908,12 @@ always_ff @(posedge clk) begin
 			end
 		end
 		E_S_NEXT: begin
+			// synthesis translate_off
+			if (e_kill && m2.r.v) begin
+				$display("FAIL: DMU: a discarded job wrote a newer uop's translation");
+				sim_kchk <= 1'b1;
+			end
+			// synthesis translate_on
 			if (m2.split && !e_part) begin
 				m2.x   <= e_x;                 // part 0, for WB
 				e_part <= 1'b1;
@@ -1641,15 +1952,7 @@ always_ff @(posedge clk) begin
 		// WB store through the engine (write-through, cache-inhibited,
 		// locked, split, MOVE16)
 		//==============================================================
-		E_W_START: begin
-			e_part <= 1'b0;
-			e_acc  <= lalign(st_data, m4.r.msz);
-			e_va   <= m4.r.a;
-			e_x    <= m4.x;
-			e_n    <= m4.split ? 3'(5'd16 - {1'b0, m4.r.a[3:0]}) : nbytes(m4.r.msz);
-			bo_err <= 1'b0;
-			e_st   <= E_W_PART;
-		end
+		// (E_W_START is no longer entered: E_IDLE sets up the WB store job)
 		E_W_PART: begin
 			logic [15:0] be; logic upd;
 			be  = bmask(e_va[3:0], e_n);
@@ -1706,8 +2009,15 @@ always_ff @(posedge clk) begin
 		end
 		E_W_DONE: begin
 			// a bus error on the write, or on a push the write made (7.6.1):
-			// an access error
-			if (bo_err || (pbe_r && pv_for == 2'd1)) begin
+			// an access error (an early MOVE16 store's makes no push; WB
+			// takes its outcome)
+			if (e_pre) begin
+				e_pre    <= 1'b0;
+				pre_done <= 1'b1;
+				pre_err  <= bo_err;
+				e_st     <= E_IDLE;
+			end
+			else if (bo_err || (pbe_r && pv_for == 2'd1)) begin
 				st_rdy_r     <= 1'b1;
 				st_fault_r   <= 1'b1;
 				st_fssw    <= bo_err ? mk_ssw(1'b0, m4.r.lock, 1'b0, m4.r.msz, m4.r.fc)
@@ -1924,7 +2234,7 @@ always_ff @(posedge clk) begin
 			e_ret   <= E_FILL_INS;
 			e_st    <= E_BUS;
 		end
-		E_FILL_INS: begin
+		E_FILL_INS: if (fv == 2'd0) begin   // (the victim's steps done)
 			if (!bo_err && !bo_tci) begin
 				dw      <= 1'b1;
 				dw_set  <= f_set;
@@ -2037,6 +2347,15 @@ always_ff @(posedge clk) begin
 				e_st      <= e_ret;
 			end
 			else begin
+				if (e_exw) begin
+					// a job set up in EX: the store is in WB now (else
+					// dropped below), its data with it
+					bo_wd <= bo_wdx;
+					e_acc <= bo_wdx;
+					e_exw <= 1'b0;
+					if (exw_ok && e_x.ok && !e_x.flt && e_x.pa[31:21] == 11'b1111_1001_000)
+						pe_vram[5:4] <= 2'b01;
+				end
 				e_breq <= 1'b1;
 				e_st   <= E_BUS_W;
 			end
@@ -2083,7 +2402,7 @@ always_ff @(posedge clk) begin
 				e_st   <= e_ret;
 			end
 			else if (b_done && bo_ingnt) begin
-				if (bo.line && bo.rd && e_ret == E_S_BUSD &&
+				if (bo.line && bo.rd && e_ret == E_S_BUSD && !e_kill &&
 				    m2.r.msz == SZ_Q && !(pbe_r && pv_for == 2'd0)) begin
 					// a MOVE16 source line read from the bus answers DC2
 					// at its last beat's TA (that beat comes with done),
@@ -2099,12 +2418,77 @@ always_ff @(posedge clk) begin
 					steal      <= 1'b0;
 					e_st       <= E_IDLE;
 				end
+				else if (bo.line && bo.rd && e_ret == E_FILL_INS && !e_kill &&
+				         m2.r.mem == M_LD && e_sret == E_S_XL && !m2.split &&
+				         fv == 2'd0 && !pv_v && !bo_err && !bo_tci &&
+				         !(b_rvalid && b_rbeat == bo_pa[3:2] && b_rtci) &&
+				         !(pbe_r && pv_for == 2'd0)) begin
+					// a load's own fill with no dirty victim installs the
+					// line and answers DC2 at its last beat's TA, the
+					// operand from the line just read: what E_FILL_INS,
+					// E_S_ACT (e_fillhit), E_S_NEXT and E_S_DONE would do,
+					// 4 clocks sooner.  The install (dw from bo_line, which
+					// takes this beat now) lands as the engine goes idle;
+					// DC1's stale check on dw covers a lookup of that set.
+					logic [127:0] ln;
+					logic  [31:0] op;
+					xres_t        xf;
+					ln = bo_line;
+					if (b_rvalid) ln[127 - 32*b_rbeat -: 32] = b_rdata;
+					op = (e_acc << (8 * e_n)) | take(ln, e_va[3:0], e_n);
+					xf = e_x;
+					xf.hit = 1'b1;
+					xf.way = f_way;
+					dw      <= 1'b1;
+					dw_set  <= f_set;
+					dw_way  <= f_way;
+					dw_be   <= 16'hFFFF;
+					dw_src  <= 2'd1;
+					tw_b    <= 1'b1;
+					tset_b  <= f_set;
+					tway_b  <= f_way;
+					twd_b   <= f_tag;
+					vp_set = f_set; vp_wm[f_way] = 1'b1;
+					vp_lwe = 1'b1; vp_lv = 1'b1; vp_dwe = 1'b1; vp_dv = 1'b0;
+					rrc        <= rrc + 2'd1;
+					e_acc      <= op;
+					e_ldata    <= op;
+					e_x        <= xf;
+					m2.x       <= xf;
+					e_job      <= 1'b0;
+					e_dc2_done <= 1'b1;
+					steal      <= 1'b0;
+					e_st       <= E_IDLE;
+					// synthesis translate_off
+					if (!m2.r.v) begin
+						$display("FAIL: DMU: a discarded job completed without its kill mark");
+						sim_kchk <= 1'b1;
+					end
+					// synthesis translate_on
+				end
+				else if (FAST_BUS && bo.line && !bo.rd && e_ret == E_W_DONE && e_wq &&
+				         !(pbe_r && pv_for == 2'd1)) begin
+					// a MOVE16 store's line write, without error: what
+					// E_W_DONE would do, a clock sooner (an early store
+					// keeps its outcome for WB instead)
+					if (e_pre) begin
+						e_pre    <= 1'b0;
+						pre_done <= 1'b1;
+						pre_err  <= 1'b0;
+					end
+					else begin
+						st_rdy_r   <= 1'b1;
+						st_fault_r <= 1'b0;
+						e_wst_done <= 1'b1;
+					end
+					e_st <= E_IDLE;
+				end
 				else if (bo.line || bo.ack != 2'd0) e_st <= e_ret;
 				else begin
 					if (!bo.rd) bo_wd <= bo_wd << (8 * bo_pn);
 					bo_pa   <= bo_pa + {29'd0, bo_pn};
 					bo_left <= bo_left - bo_pn;
-					if (bo_left == bo_pn && bo.rd && e_ret == E_S_BUSD &&
+					if (bo_left == bo_pn && bo.rd && e_ret == E_S_BUSD && !e_kill &&
 					    m2.r.ack == 2'd0 && m2.r.msz != SZ_Q && !m2.split &&
 					    !(pbe_r && pv_for == 2'd0)) begin
 						// a plain single-part read (the uncached VRAM and
@@ -2133,6 +2517,17 @@ always_ff @(posedge clk) begin
 							sim_kchk <= 1'b1;
 						end
 						// synthesis translate_on
+					end
+					else if (FAST_BUS && bo_left == bo_pn && !bo.rd &&
+					         e_ret == E_W_DONE && !m4.split &&
+					         !(pbe_r && pv_for == 2'd1)) begin
+						// a store's last piece, without error: what
+						// E_W_DONE would do, a clock sooner (a split
+						// store, or a push's TEA, still goes there)
+						st_rdy_r   <= 1'b1;
+						st_fault_r <= 1'b0;
+						e_wst_done <= 1'b1;
+						e_st       <= E_IDLE;
 					end
 					else if (bo_left == bo_pn) e_st <= e_ret;
 					else e_breq <= 1'b1;
@@ -2398,7 +2793,53 @@ always_ff @(posedge clk) begin
 		default: e_st <= E_IDLE;
 		endcase
 
+		// the victim's steps of a fill requested from E_S_ACT, beside the
+		// engine's bus wait: E_FILL's (skip a way a store still holds,
+		// then read the set through the stolen ports), E_FILLW's (the RAMs
+		// register it) and E_FILL_W's (a dirty victim into the push buffer,
+		// the way invalidated).  The engine writes no valid bits, tags or
+		// steal meanwhile (E_BUS_W; E_FILL_INS waits for fv), and DC1 is
+		// held (dm_hold1: the engine is busy on a line).
+		if (!sn_frz && fv != 2'd0) begin
+			case (fv)
+			2'd1:
+				if (store_holds(f_set, f_way, m3, m4))
+					f_way <= f_way + 2'd1;  // that line belongs to a store
+				else begin
+					steal  <= 1'b1;
+					st_set <= f_set;
+					tset_b <= f_set;
+					fv     <= 2'd2;
+				end
+			2'd2: fv <= 2'd3;
+			default: begin
+				if (lve_q[f_way] && ld_q[f_way]) begin  // (ld_ra, lv_ra: f_set)
+					pv_v     <= 1'b1;
+					pv_line  <= dq_w;
+					pv_lpa   <= {tq_b[f_way], f_set};
+					pv_dirty <= 1'b1;
+					pv_tln   <= f_way;
+					pv_lock  <= 1'b0;
+					pv_for   <= 2'd0;
+				end
+				vp_set = f_set; vp_wm[f_way] = 1'b1;
+				vp_lwe = 1'b1; vp_lv = 1'b0; vp_dwe = 1'b1; vp_dv = 1'b0;
+				fv <= 2'd0;
+			end
+			endcase
+		end
+
 		if ((e_st == E_SP_W || e_st == E_SP_2) && dw && dw_set == st_set) sp_dw <= 1'b1;
+
+		// a job set up in EX whose store did not arrive in WB valid (an
+		// exception, suppressed, killed as it moved): dropped unasked,
+		// frozen or not (the store leaves WB at once then)
+		if (e_exw && !exw_ok) begin
+			e_exw  <= 1'b0;
+			e_breq <= 1'b0;
+			e_wq   <= 1'b0;
+			e_st   <= E_IDLE;
+		end
 
 		if (kill_now) begin
 			// a kill comes with the WB uop leaving (or WB empty): every

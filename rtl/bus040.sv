@@ -16,7 +16,8 @@ module bus040 #(
     input bus_ack,
     input [31:0] bus_rdata,
     input berr,
-    output dbg_stall_flt, busy
+    output dbg_stall_flt, busy,
+    output line_more            // a line transfer with beats after this one
 );
 
 wire ts = c_a_oe && !c_ts_n;
@@ -50,6 +51,7 @@ always @(posedge clk) begin
 end
 
 assign bus_req = req;
+assign line_more = is_line && (beat != 2'd3);
 assign bus_write = !c_rw_n;
 assign bus_instr = (c_tm == 3'd2) || (c_tm == 3'd6);
 assign bus_fc = c_tm;

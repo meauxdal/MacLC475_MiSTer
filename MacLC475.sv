@@ -67,7 +67,7 @@ localparam CONF_STR = {
 	"SC4,ISOTO*CUEBINCHD,CD-ROM (ID 3);",
 `ifdef SWIM2
 	"S6,DSKIMGIMA,Floppy disk;",
-	"O[18],Floppy lock,Off,On;",
+	"O[18],Floppy Write Protect,Off,On;",
 `endif
 	"F0,ROM,Load ROM;",
 	"-;",

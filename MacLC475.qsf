@@ -1,4 +1,3 @@
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/video_probe.sv
 set_global_assignment -name PARTITION_NETLIST_TYPE SOURCE -section_id Top
 set_global_assignment -name PARTITION_FITTER_PRESERVATION_LEVEL PLACEMENT_AND_ROUTING -section_id Top
 set_global_assignment -name PARTITION_COLOR 16764057 -section_id Top
@@ -263,46 +262,6 @@ set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to LED_*
 set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to BTN_*
 set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to BTN_*
 source files.qip
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/bus040.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu040.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/lc475.sv
-set_global_assignment -name SDC_FILE MacLC475.sdc
-set_global_assignment -name SYSTEMVERILOG_FILE MacLC475.sv
-set_global_assignment -name QIP_FILE rtl/pll.qip
-set_global_assignment -name VERILOG_FILE rtl/pll_video.v
-set_global_assignment -name QIP_FILE rtl/ap68040_faster/rtl/ap68040.qip
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/quadra_bus040.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/quadra_cpu040.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/perf_counters.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/wombat_store_buffer.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/wombat_bus32.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/quadra605.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/startup_probe.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/video_control.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/rate_enable.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/memcjr.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/iosb.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/via6522.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/dafb.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/vram_ddr3.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/rom_cache_128k.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/easc.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/ncr53c96.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/cd_audio.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/sonic_mbx.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/scsi_cache.sv
-set_global_assignment -name VERILOG_FILE rtl/scc.v
-set_global_assignment -name VERILOG_FILE rtl/uart/txuart.v
-set_global_assignment -name VERILOG_FILE rtl/uart/rxuart.v
-set_global_assignment -name VERILOG_FILE rtl/dpram.v
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram_beat32.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/cuda/m68hc05_core.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/cuda/m68hc05_alu.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/cuda/cuda_mcu.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/cuda/cuda_board.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/adb_device.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/cuda/cuda_pram_host.sv
 
 set_instance_assignment -name FAST_INPUT_REGISTER ON -to SDRAM_DQ[*]
 set_instance_assignment -name FAST_OUTPUT_REGISTER ON -to HDMI_TX_CLK

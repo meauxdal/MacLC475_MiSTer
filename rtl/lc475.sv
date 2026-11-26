@@ -215,6 +215,7 @@ reg         snoop_stb;
 // CPU bundle and the transaction-to-beat adapter
 //----------------------------------------------------------------------------
 wire        bus_req, bus_write, bus_instr;
+wire        bus_line_more;                    // a line read with beats after this one
 wire  [1:0] bus_size;
 wire [31:0] bus_addr, bus_wdata;
 wire  [2:0] bus_fc;
@@ -226,6 +227,7 @@ wire [31:0] bus_rdata_adapter;
 wire        bus_adapter_active;
 wire        bus_req_adapter;
 reg         bus_line_ack;
+reg         bus_line_vram;                    // bus_line_ack is a VRAM fast hit
 reg  [31:0] bus_line_rdata;
 reg         bus_miss_ack;
 reg  [31:0] bus_miss_rdata;
@@ -369,6 +371,7 @@ wombat_cpu #(.AP040_HAS_FPU(AP040_HAS_FPU)) cpu (
 	.bus_fc(bus_fc),
 	.bus_ack(bus_ack),
 	.bus_rdata(bus_rdata),
+	.bus_line_more(bus_line_more),
 
 	.walker_req(walker_req),
 	.walker_we(walker_we),
@@ -764,6 +767,42 @@ wire [31:0] bus_line_data = (bus_addr[3:2] == 2'd0) ? mem_line_data[127:96] :
 	                        (bus_addr[3:2] == 2'd2) ? mem_line_data[63:32]  :
 	                                                          mem_line_data[31:0];
 
+// Line bursts (2026-11-22).  A cache line fill used to take two clocks a
+// beat after its first: the beat's registered acknowledge, then a clock in
+// which the next beat's address was decoded with the guards above holding
+// it off.  In the clock a RAM or ROM line beat is acknowledged, with more
+// beats to come (cpu040 holds the read in the store buffer between them),
+// the next longword of the same line is looked up now and its acknowledge
+// registered for the next clock, when bus040 presents that beat.  Only
+// from a retained line that is already whole; a tail still arriving waits
+// in bus_line_wait as before.  The beat order is bus040's: the critical
+// long word first, then on round the line.
+localparam LINE_BURST = 1;
+wire  [1:0] bus_next_lw    = bus_addr[3:2] + 2'd1;
+wire bus_burst_next = bus_line_more && bus_req && !bus_write && (bus_line_ack || bus_miss_ack) &&
+	                  (svc == S_IDLE) && !walker_pend && !cpu_berr && !bus_adapter_active &&
+	                  !bus_ack_adapter && !wr_split_pend && (bus_size == 2'd2) && (bus_addr[1:0] == 2'b00);
+wire bus_next_ram = bus_burst_next && (decode(bus_addr[31:2]) == 3'd0) &&
+	                line_valid_sw && (bus_ram[24:2] == mem_line_tag);
+wire bus_next_rom = bus_burst_next && (decode(bus_addr[31:2]) == 3'd1) &&
+	                mem_rom_line_valid && (bus_addr[19:4] == mem_rom_line_tag);
+// VRAM: a MOVE16 source line read whose beat was a fast hit in vram_ddr3's
+// line cache looks its next longword up there in the acknowledge clock
+// (mem_vram_fast_addr steps on below), so the beats go one a clock instead
+// of two.  Only after a fast hit: a beat answered through S_MEM is not
+// followed this way, its next beat takes the fast port's ordinary path.
+wire bus_next_vram = bus_burst_next && bus_line_ack && bus_line_vram &&
+	                 (decode(bus_addr[31:2]) == 3'd2) && mem_vram_fast_hit;
+wire [31:0] bus_next_data = bus_next_rom ?
+	                        ((bus_next_lw == 2'd0) ? mem_rom_line_data[127:96] :
+	                         (bus_next_lw == 2'd1) ? mem_rom_line_data[95:64]  :
+	                         (bus_next_lw == 2'd2) ? mem_rom_line_data[63:32]  :
+	                                                 mem_rom_line_data[31:0]) :
+	                        ((bus_next_lw == 2'd0) ? mem_line_data[127:96] :
+	                         (bus_next_lw == 2'd1) ? mem_line_data[95:64]  :
+	                         (bus_next_lw == 2'd2) ? mem_line_data[63:32]  :
+	                                                 mem_line_data[31:0]);
+
 // A RAM write inside one longword -- the store buffer's drain -- goes
 // straight into the bridge's write FIFO: registered here, acknowledged next
 // clock through bus_miss_ack, with no wombat_bus32 beat and no S_MEM wait.
@@ -820,9 +859,12 @@ wire bus_vram_rd = (svc == S_IDLE) && !walker_pend && !cpu_berr &&
 // retained RAM line: looked up from bus_addr, acknowledge registered in
 // the request's own clock, no mem_req.  Two clocks a read instead of the
 // four through S_MEM (mem_req, vram_ack, bus_miss_ack registered in turn).
-assign mem_vram_fast_addr = bus_addr[31:2];
+// In a VRAM fast hit's acknowledge clock the port looks up the line's next
+// longword (bus_next_vram); bus_vram_rd is low then, so nothing else reads it.
+assign mem_vram_fast_addr = (bus_line_ack && bus_line_vram) ?
+	                        {bus_addr[31:4], bus_next_lw} : bus_addr[31:2];
 wire        bus_vram_fast = bus_vram_rd && mem_vram_fast_hit;
-assign mem_vram_fast_take = bus_vram_fast;
+assign mem_vram_fast_take = bus_vram_fast || ((LINE_BURST != 0) && bus_next_vram);
 wire [31:0] bus_vram_fast_data = (mem_vram_fast_data << {bus_addr[1:0], 3'd0}) >> {3'd4 - bus_wr_bytes, 3'd0};
 
 assign bus_req_adapter = bus_req && !bus_line_match && !bus_line_wait && !bus_wr_direct && !bus_vram_direct && !bus_vram_rd &&
@@ -833,19 +875,27 @@ assign bus_req_adapter = bus_req && !bus_line_match && !bus_line_wait && !bus_wr
 always @(posedge clk) begin
 	if (!nreset) begin
 		bus_line_ack   <= 0;
+		bus_line_vram  <= 0;
 		bus_line_rdata <= 0;
 	end
 	else if (ce) begin
-		bus_line_ack <= 0;
+		bus_line_ack  <= 0;
+		bus_line_vram <= 0;
 		if (!bus_line_ack && (bus_line_match || bus_rom_match || bus_vram_fast)) begin
 			bus_line_ack   <= 1;
+			bus_line_vram  <= bus_vram_fast;
 			bus_line_rdata <= bus_vram_fast ? bus_vram_fast_data :
 			                  bus_rom_match ? bus_rom_data : bus_line_data;
+		end
+		else if ((LINE_BURST != 0) && (bus_next_ram || bus_next_rom || bus_next_vram)) begin
+			bus_line_ack   <= 1;
+			bus_line_vram  <= bus_next_vram;
+			bus_line_rdata <= bus_next_vram ? mem_vram_fast_data : bus_next_data;
 		end
 	end
 end
 
-wire cpu_want = walker_pend || bus_first_miss || bus_wr_direct || bus_vram_direct || bus_vram_rd || bus_rom_first ||
+wire cpu_want = walker_pend || bus_first_miss || (LINE_BURST != 0 && (bus_next_ram || bus_next_rom || bus_next_vram)) || bus_wr_direct || bus_vram_direct || bus_vram_rd || bus_rom_first ||
                 (b_req && !b_ack && !cpu_berr && !line_cpu_wait);
 wire dma_take = (SONIC != 0) && dma_req && !dma_ack && !walker_pend &&
                 (dma_turn || !cpu_want);
@@ -991,8 +1041,9 @@ always @(posedge clk) begin
 				reg [31:2] a;
 				reg        wr;
 				dma_turn <= 1;
-				if (bus_vram_fast) begin
+				if (bus_vram_fast || ((LINE_BURST != 0) && (bus_next_ram || bus_next_rom || bus_next_vram))) begin
 					// answered by the line acknowledge above; nothing to launch
+					// (a burst's next beat is in cpu_want only to hold off DMA)
 				end
 				else if (bus_vram_rd && mem_vram_wp) begin
 					// a read of the longword the write strobe is landing in:

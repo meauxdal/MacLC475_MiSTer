@@ -21,6 +21,3 @@ jtag.cdf
 *.wlf
 __pycache__/
 refs/
-AGENTS.md
-CLAUDE.md
-HANDOFF.md

@@ -93,6 +93,16 @@ reg storage_initialized = 0;
 reg time_initialized = 0;
 reg [1:0] seed_addr;
 reg [31:0] seed_seconds;
+// hps_io fills TIMESTAMP[31:0] one 16-bit word at a time, low word first, and
+// toggles TIMESTAMP[32] only once the whole command has been received.  A
+// seed taken while [31:0] first turns nonzero would catch a half-written
+// value (the high word still 0, so a date in 1970), so wait for the toggle.
+reg timestamp_msb_d = 0;
+reg timestamp_complete = 0;
+always @(posedge clk) begin
+    timestamp_msb_d <= timestamp[32];
+    if (timestamp[32] != timestamp_msb_d) timestamp_complete <= 1;
+end
 wire startup_release = cpu_tick && !cpu_read && cpu_addr == 13'h0002 &&
     cpu_wdata[3] && !pc_latch[3];
 wire live_pram = HOST_STORAGE && storage_initialized &&
@@ -111,7 +121,7 @@ always @(posedge clk) begin
         if (HOST_STORAGE && !storage_initialized && startup_release)
             storage_initialized <= 1;
         if (HOST_STORAGE && storage_initialized && !time_initialized &&
-            !restore_active && timestamp[31:0] != 0) begin
+            !restore_active && timestamp_complete && timestamp[31:0] != 0) begin
             seed_seconds <= timestamp[31:0] + 32'd2082844800;
             seed_addr <= 0;
             restore_active <= 1;

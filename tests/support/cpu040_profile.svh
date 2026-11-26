@@ -1,5 +1,5 @@
 // Included by tb_cpu040_machine. Synthetic workloads, not Speedometer scores.
-localparam PROFILE_CASES = 11;
+localparam PROFILE_CASES = 16;
 string profile_name [0:PROFILE_CASES-1];
 reg [31:0] profile_start [0:PROFILE_CASES-1], profile_end [0:PROFILE_CASES-1];
 integer profile_cycles = 0;
@@ -55,11 +55,13 @@ task automatic perf_check(input integer runs);
     // the engine's own counts of frame buffer accesses: no workload here is
     // split, so a store is one beat; a read can be discarded after dispatch.
     // A MOVE16 is one access and four beats each way: a run's 256 from
-    // VRAM read 768 beats more than accesses, its 512 to VRAM write 1536
-    // more (the counters run on across the runs).  Slots 32 and 37 (the
-    // fast reads and posted stores, both gone from the DMU) count RAM data
-    // line reads now: all VRAM accesses take the general path.
-    m16r = 768 * runs;
+    // VRAM, and the one the copy loop's exit discards (a PA_NS read, on the
+    // bus before the branch resolves), read 771 beats more than accesses;
+    // its 512 to VRAM write 1536 more (the counters run on across the
+    // runs).  Slots 32 and 37 (the fast reads and posted stores, both gone
+    // from the DMU) count RAM data line reads now: all VRAM accesses take
+    // the general path.
+    m16r = 771 * runs;
     m16w = 1536 * runs;
     if (dut.cpu.perf.cnt[38] + m16w != dut.cpu.perf.cnt[26] ||
         dut.cpu.perf.cnt[35] != 0 ||
@@ -114,14 +116,20 @@ end
 
 task automatic profile_loop(input integer which);
     integer loop_pc;
-    emit16('h207C); emit32(which == 10 ? 'h4000 : which < 3 ? (which == 2 ? 'h4000 : 'h2000) :
+    // cases 11-15: RAM in copyback mode (DTT0 over the low 16 MB, as Mac OS
+    // runs it on an 040); the others keep the default write-through mode
+    if (which >= 11) begin
+        emit16('h203C); emit32('h0000C020); // MOVE.L #DTT0,D0
+        emit16('h4E7B); emit16('h0006); // MOVEC D0,DTT0
+    end
+    emit16('h207C); emit32(which == 15 ? 'h18000 : which == 14 ? 'h10000 : which == 13 ? 'h3100 : which >= 11 ? 'h3000 : which == 10 ? 'h4000 : which < 3 ? (which == 2 ? 'h4000 : 'h2000) :
                           (which == 9 ? 'hF9006000 : which == 8 ? 'hF9005000 : which == 7 ? 'hF9004000 :
                            which == 5 ? 'hF9002000 : which == 4 ? 'hF9001000 : 'hF9000000)); // MOVEA.L #a,A0
     if (which == 7) begin
         emit16('h243C); emit32('hFFFF0000); // MOVE.L #mask,D2
         emit16('h263C); emit32('h0000ABCD); // MOVE.L #pattern,D3
     end
-    emit16('h227C); emit32(which == 10 ? 'hF9008000 : which == 9 ? 'hF9007000 : 'hF9003000); // MOVEA.L #a,A1
+    emit16('h227C); emit32(which == 15 ? 'h1C000 : which == 14 ? 'h14000 : which == 10 ? 'hF9008000 : which == 9 ? 'hF9007000 : 'hF9003000); // MOVEA.L #a,A1
     emit16('h7000); // MOVEQ #0,D0
     emit16('h323C); emit16(255); // MOVE.W #255,D1
     loop_pc = pc;
@@ -175,20 +183,67 @@ task automatic profile_loop(input integer which);
             profile_name[which] = "RAM to VRAM MOVE16 copy";
             emit16('hF620); emit16('h9000); // MOVE16 (A0)+,(A1)+
         end
+        11: begin
+            profile_name[which] = "copyback RAM read/modify/write";
+            emit16('h2010); // MOVE.L (A0),D0
+            emit16('h5280); // ADDQ.L #1,D0
+            emit16('h2080); // MOVE.L D0,(A0)
+        end
+        12: begin
+            // stack push and pop (SP is the reset SSP, 0x7000); pops into
+            // D0, not D1, which is the loop counter
+            profile_name[which] = "copyback stack push/pop";
+            emit16('h2F00); // MOVE.L D0,-(SP)
+            emit16('h201F); // MOVE.L (SP)+,D0
+            emit16('h5280); // ADDQ.L #1,D0
+        end
+        13: begin
+            // a load behind a store to another longword of the same line
+            profile_name[which] = "copyback load after store, same line";
+            emit16('h2080); // MOVE.L D0,(A0)
+            emit16('h2428); emit16(4); // MOVE.L 4(A0),D2
+            emit16('h5280); // ADDQ.L #1,D0
+        end
+        14: begin
+            // BlockMove's copy: RAM to RAM by lines, 8 KB (twice the data
+            // cache), so the source comes from the bus
+            profile_name[which] = "copyback RAM to RAM MOVE16 copy, 8 KB";
+            repeat (2) begin
+                emit16('hF620); emit16('h9000); // MOVE16 (A0)+,(A1)+
+            end
+        end
+        15: begin
+            // the same 8 KB by longwords (BlockMove without MOVE16)
+            profile_name[which] = "copyback RAM to RAM MOVE.L copy, 8 KB";
+            repeat (8) emit16('h22D8); // MOVE.L (A0)+,(A1)+
+        end
     endcase
     profile_start[which] = 'h40800000 + pc;
     emit16('h51C9); emit16(16'(loop_pc - pc)); // DBRA D1,loop
     profile_end[which] = 'h40800000 + pc;
     emit16('h4E71); // NOP: end marker
+    if (which >= 11) begin
+        // push the dirty lines, then back to write-through so the
+        // signature store reaches the bus
+        emit16('hF478); // CPUSHA DC
+        emit16('h7400); // MOVEQ #0,D2
+        emit16('h4E7B); emit16('h2006); // MOVEC D2,DTT0
+    end
     emit16('h23C0); emit32('h100 + which*4); // result signature
     case (which)
         0: expected[which] = 1024;
-        1,4,5: expected[which] = 256;
+        1,4,5,11,12,13: expected[which] = 256;
         2,3: expected[which] = 'h12345678;
-        6,8,9,10: expected[which] = 0;
+        6,8,9,10,14,15: expected[which] = 0;
         7: expected[which] = 'h0000ABCD;
     endcase
 endtask
+
+function automatic [29:0] mapped_of(input integer a);
+    reg [30:0] m;
+    m = dut.ram_map(30'(a >> 2));
+    return m[29:0];
+endfunction
 
 task automatic run_profile;
     integer first_cycle, engine_total, biu_total;
@@ -255,6 +310,16 @@ task automatic run_profile;
             for (integer j = 0; j < 4; j++)
                 ram[backing_addr+j] = 8'((i+j)*5 + ((i+j) >> 8) + 1);
         end
+        // the copyback copy sources (cases 14 and 15), 8 KB each
+        for (integer i = 0; i < 'h2000; i += 4)
+            for (integer s = 0; s < 2; s++) begin
+                mapped = dut.ram_map(30'(((s ? 'h18000 : 'h10000)+i) >> 2));
+                backing_addr = {mapped[29:0], 2'b00};
+                if (!mapped[30] || backing_addr < 0 || backing_addr > 4194300)
+                    $fatal(1, "Profile RAM copy source exceeds backing");
+                for (integer j = 0; j < 4; j++)
+                    ram[backing_addr+j] = 8'((i+j)*3 + ((i+j) >> 8) + s*11 + 2);
+            end
         if (read32(0, {rmw_mapped[29:0], 2'b00}) !== 32'd0)
             $fatal(1, "Profile RAM update region was not initialized to zero");
         for (integer k = 0; k < PROFILE_CASES; k++) begin
@@ -298,7 +363,7 @@ task automatic run_profile;
             $display("; overlapping pipeline holds DC2=%0d WB=%0d", profile_dc2_hold, profile_wb_hold);
             if (engine_total != profile_cycles-first_cycle || biu_total != engine_total)
                 $fatal(1, "Profile state census does not cover the measured interval");
-            if (k >= 3) begin : beat_check
+            if (k >= 3 && k <= 10) begin : beat_check
                 // a MOVE16 moves a line: four beats each way
                 integer per;
                 per = k >= 9 ? 4 : 1;
@@ -348,7 +413,22 @@ task automatic run_profile;
             if (vram['h8000+i] !== (i < 1024 ? 8'(32'h12345678 >> (24 - 8*(i % 4))) :
                                                8'(i*5 + (i >> 8) + 1)))
                 $fatal(1, "RAM to VRAM MOVE16 copy result %0d", i);
-        $display("PASS: CPU040 cycle profile run %0d: eleven workload signatures and VRAM contents", run);
+        // the copyback cases' data, pushed by CPUSHA: case 11's count
+        // (0x3000), case 12's last push and case 13's last store (255)
+        if (read32(0, {mapped_of('h3000), 2'b00}) !== 32'd256 ||
+            read32(0, {mapped_of('h6FFC), 2'b00}) !== 32'd255 ||
+            read32(0, {mapped_of('h3100), 2'b00}) !== 32'd255)
+            $fatal(1, "Profile copyback RAM results %h %h %h",
+                   read32(0, {mapped_of('h3000), 2'b00}), read32(0, {mapped_of('h6FFC), 2'b00}),
+                   read32(0, {mapped_of('h3100), 2'b00}));
+        for (integer i = 0; i < 'h2000; i += 4)
+            for (integer s = 0; s < 2; s++)
+                if (read32(0, {mapped_of((s ? 'h1C000 : 'h14000) + i), 2'b00}) !==
+                    {8'(i*3 + (i >> 8) + s*11 + 2), 8'((i+1)*3 + ((i+1) >> 8) + s*11 + 2),
+                     8'((i+2)*3 + ((i+2) >> 8) + s*11 + 2), 8'((i+3)*3 + ((i+3) >> 8) + s*11 + 2)})
+                    $fatal(1, "Profile copyback RAM copy result: case %0d offset %h: %h",
+                           14 + s, i, read32(0, {mapped_of((s ? 'h1C000 : 'h14000) + i), 2'b00}));
+        $display("PASS: CPU040 cycle profile run %0d: %0d workload signatures and VRAM contents", run, PROFILE_CASES);
         perf_check(run + 1);
     end
 endtask

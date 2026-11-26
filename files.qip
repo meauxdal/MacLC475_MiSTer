@@ -10,6 +10,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/wombat_store_buffer.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/wombat_bus32.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/lc475.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/startup_probe.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/video_probe.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/video_control.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/rate_enable.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/memcjr.sv
